@@ -1,0 +1,42 @@
+# ── Binários ──────────────────────────────────────────────────────────────────
+/relay
+/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Output do go build
+*.out
+*.test
+
+# ── Dependências ──────────────────────────────────────────────────────────────
+# go.sum é commitado — não ignorar
+# vendor/ só ignorar se não estiver usando vendor mode
+vendor/
+
+# ── Ambiente ──────────────────────────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+
+# ── Cobertura de testes ───────────────────────────────────────────────────────
+coverage.out
+coverage.html
+
+# ── IDEs e editores ───────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*.DS_Store
+Thumbs.db
+
+# ── Docker ────────────────────────────────────────────────────────────────────
+# Não ignorar os docker-compose — eles são parte do projeto
+# Ignorar apenas overrides locais
+docker-compose.override.yml
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log

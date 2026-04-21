@@ -1,0 +1,54 @@
+services:
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    hostname: rabbit-doc-validator
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"   # management UI → http://localhost:15672
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - relay_internal
+
+  relay:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      # DATABASE_URL must point to the db service in the Rails compose,
+      # reachable via the shared network.
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/doc_validator_development
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_USER: ${RABBITMQ_USER}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD}
+      RABBITMQ_EXCHANGE: ${RABBITMQ_EXCHANGE:-doc_validator.events}
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - relay_internal        # talks to RabbitMQ
+      - doc_validator_shared_db  # talks to Postgres (owned by the Rails compose)
+
+volumes:
+  rabbitmq_data:
+
+networks:
+  # Internal network — relay ↔ rabbitmq only
+  relay_internal:
+    driver: bridge
+
+  # Shared network created by the Rails compose.
+  # The Rails compose must declare it as an attachable network (see README).
+  doc_validator_shared_db:
+    external: true
