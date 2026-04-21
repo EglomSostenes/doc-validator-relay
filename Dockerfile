@@ -1,5 +1,5 @@
 # ── Stage 1: builder ──────────────────────────────────────────────────────────
-FROM golang:1.22-alpine AS builder
+FROM golang:1.25-alpine AS builder
 
 # git is needed for `go mod download` with some indirect deps
 RUN apk add --no-cache git ca-certificates tzdata

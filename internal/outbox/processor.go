@@ -120,22 +120,62 @@ func (p *Processor) applyFailure(ctx context.Context, event db.OutboxEvent, err 
 	}
 }
 
-// markPublished updates the event to published status.
+// markPublished persists the published status after the broker has confirmed
+// delivery. It retries aggressively on database errors because this is the
+// critical window — the broker already has the message, so if we fail to
+// persist "published" the ReclaimStaleProcessing will reset to "pending" and
+// the event will be published again.
+//
+// Strategy:
+//   - Up to maxMarkPublishedAttempts retries with exponential backoff
+//   - Uses a detached context so a cancelled request context does not abort
+//     the persist — the broker already confirmed, we must record that
+//   - If all attempts fail, logs a critical alert so the operator can
+//     manually resolve the orphaned event before ReclaimStaleProcessing acts
 func (p *Processor) markPublished(ctx context.Context, event db.OutboxEvent) {
+	const maxAttempts = 5
+	backoff := 100 * time.Millisecond
+
 	params := db.UpdateParams{
 		ID:     event.ID,
 		Status: db.StatusPublished,
 	}
 
-	if err := p.store.UpdateEvent(ctx, params); err != nil {
-		p.logger.Error("failed to mark event as published",
+	// Use a detached context with a generous timeout so a cancelled request
+	// context (e.g. shutdown signal) does not abort the critical DB write.
+	persistCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		err := p.store.UpdateEvent(persistCtx, params)
+		if err == nil {
+			p.logger.Info("event published",
+				zap.Int64("event_id", event.ID),
+				zap.String("event_type", event.EventType),
+			)
+			return
+		}
+
+		p.logger.Warn("failed to mark event as published, retrying",
 			zap.Int64("event_id", event.ID),
+			zap.Int("attempt", attempt),
+			zap.Int("max_attempts", maxAttempts),
+			zap.Duration("backoff", backoff),
 			zap.Error(err),
 		)
-		return
+
+		select {
+		case <-persistCtx.Done():
+			break
+		case <-time.After(backoff):
+			backoff *= 2 // exponential: 100ms → 200ms → 400ms → 800ms → 1.6s
+		}
 	}
 
-	p.logger.Info("event published",
+	// All attempts failed. The event is still in "processing" status.
+	// ReclaimStaleProcessing will eventually reset it to "pending" and it
+	// will be published again. The consumer MUST deduplicate using event_id.
+	p.logger.Error("CRITICAL: broker confirmed but failed to persist published status — event will be republished after processing timeout",
 		zap.Int64("event_id", event.ID),
 		zap.String("event_type", event.EventType),
 	)
