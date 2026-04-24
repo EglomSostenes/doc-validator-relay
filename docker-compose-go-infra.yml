@@ -1,0 +1,23 @@
+name: go-relay
+
+services:
+  relay:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-doc_validator_development}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_USER: ${RABBITMQ_USER}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD}
+      RABBITMQ_EXCHANGE: ${RABBITMQ_EXCHANGE:-doc_validator.events}
+    restart: unless-stopped
+    networks:
+      - infra-net
+
+networks:
+  infra-net:
+    external: true
+    name: local-infra-net
+    
