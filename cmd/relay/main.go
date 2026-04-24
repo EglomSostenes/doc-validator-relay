@@ -5,7 +5,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
+	// "time" // REMOVIDO: era usado apenas no provisionWithRetry (infra), que foi desativado
 
 	"github.com/joho/godotenv"
 	"go.uber.org/zap"
@@ -42,10 +42,13 @@ func main() {
 	logger.Info("postgres connected")
 
 	// ── RabbitMQ topology ───────────────────────────────────────────────────
-	// Provision is idempotent: safe to run on every startup.
+	// DESATIVADO:
+	// A infraestrutura (exchange, queues, bindings) agora é provisionada via
+	// Docker + definitions.json. O relay NÃO deve mais declarar recursos.
+	//
 	// topology := publisher.DefaultTopology(cfg.RabbitMQ)
 	// if err := provisionWithRetry(cfg.RabbitMQ, topology, logger); err != nil {
-		// logger.Fatal("cannot provision rabbitmq topology", zap.Error(err))
+	//     logger.Fatal("cannot provision rabbitmq topology", zap.Error(err))
 	// }
 	// logger.Info("rabbitmq topology ready")
 
@@ -67,10 +70,18 @@ func main() {
 	logger.Info("doc-validator-relay stopped gracefully")
 }
 
-// provisionWithRetry retries RabbitMQ provisioning up to 10 times with a
-// 3-second back-off. This handles the race between the service container and
-// the RabbitMQ container during docker-compose startup.
-/* func provisionWithRetry(cfg config.RabbitMQConfig, topology publisher.Topology, logger *zap.Logger) error {
+/*
+DESATIVADO:
+Provisionamento de infraestrutura RabbitMQ foi movido para o ambiente (Docker + definitions.json).
+
+Motivo:
+- Evitar conflito de declaração (PRECONDITION_FAILED)
+- Separar responsabilidade: infra vs aplicação
+- Tornar o relay focado apenas em publicação (outbox pattern)
+
+Se necessário reativar (ambiente sem definitions.json), restaurar uso em main.go.
+
+func provisionWithRetry(cfg config.RabbitMQConfig, topology publisher.Topology, logger *zap.Logger) error {
 	const maxAttempts = 10
 	const backoff = 3 * time.Second
 
@@ -88,8 +99,9 @@ func main() {
 		time.Sleep(backoff)
 	}
 
-	return publisher.Provision(cfg, topology, logger) // final attempt, return real error
-} */
+	return publisher.Provision(cfg, topology, logger)
+}
+*/
 
 func buildLogger() *zap.Logger {
 	if os.Getenv("RAILS_ENV") == "production" || os.Getenv("GO_ENV") == "production" {
