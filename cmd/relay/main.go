@@ -70,7 +70,7 @@ func main() {
 // provisionWithRetry retries RabbitMQ provisioning up to 10 times with a
 // 3-second back-off. This handles the race between the service container and
 // the RabbitMQ container during docker-compose startup.
-func provisionWithRetry(cfg config.RabbitMQConfig, topology publisher.Topology, logger *zap.Logger) error {
+/* func provisionWithRetry(cfg config.RabbitMQConfig, topology publisher.Topology, logger *zap.Logger) error {
 	const maxAttempts = 10
 	const backoff = 3 * time.Second
 
@@ -89,7 +89,7 @@ func provisionWithRetry(cfg config.RabbitMQConfig, topology publisher.Topology, 
 	}
 
 	return publisher.Provision(cfg, topology, logger) // final attempt, return real error
-}
+} */
 
 func buildLogger() *zap.Logger {
 	if os.Getenv("RAILS_ENV") == "production" || os.Getenv("GO_ENV") == "production" {
