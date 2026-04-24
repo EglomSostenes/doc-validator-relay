@@ -25,6 +25,21 @@ type Claimer interface {
 //   - Each event runs in its own goroutine; the semaphore prevents unbounded growth.
 //   - The poll interval is adaptive: if a full batch was returned, the next poll
 //     fires immediately (catch-up mode); otherwise it waits the configured interval.
+//
+// FIX: the original loop used a `default` branch in the outer select, which
+// caused poll() to be called in a tight spin whenever reclaimTicker had no
+// event ready. Under burst load this fired poll() multiple times before any
+// worker had finished, resulting in events stuck in "processing":
+//
+//   Original (broken):
+//     select {
+//     case <-ctx.Done():   ...
+//     case <-reclaimTicker.C: ...
+//     default:             poll() ← spins freely, no back-pressure
+//     }
+//
+//   Fixed: a dedicated pollTicker drives poll cadence. Reset(0) provides the
+//   immediate re-poll when a full batch is found, without a spin loop.
 type Poller struct {
 	claimer   Claimer
 	processor *Processor
@@ -58,29 +73,38 @@ func (p *Poller) Run(ctx context.Context) {
 	reclaimTicker := time.NewTicker(p.cfg.ProcessingTimeout / 2)
 	defer reclaimTicker.Stop()
 
+	// pollTicker drives the poll cadence.
+	// Reset(0) is used for immediate re-poll when a full batch is found.
+	pollTicker := time.NewTicker(p.cfg.PollInterval)
+	defer pollTicker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			p.logger.Info("poller shutting down, draining in-flight workers")
 			// Acquire all semaphore slots to wait for in-flight goroutines.
-			_ = sem.Acquire(ctx, int64(p.cfg.WorkerCount))
+			// Use context.Background() so the drain is not interrupted by
+			// the already-cancelled ctx.
+			if err := sem.Acquire(context.Background(), int64(p.cfg.WorkerCount)); err != nil {
+				p.logger.Error("failed to drain workers on shutdown", zap.Error(err))
+			}
 			p.logger.Info("poller stopped")
 			return
 
 		case <-reclaimTicker.C:
 			p.reclaimStale(ctx)
 
-		default:
+		case <-pollTicker.C:
 			full := p.poll(ctx, sem)
-
-			if !full {
-				// Batch was smaller than BatchSize — no backlog, wait before polling again.
-				select {
-				case <-ctx.Done():
-				case <-time.After(p.cfg.PollInterval):
-				}
+			if full {
+				// Full batch returned — there may be more events queued.
+				// Reset to fire immediately on the next iteration so we
+				// drain the backlog without spinning in a tight loop.
+				pollTicker.Reset(0)
+			} else {
+				// No backlog — restore the normal cadence.
+				pollTicker.Reset(p.cfg.PollInterval)
 			}
-			// If the batch was full, loop immediately to drain the backlog.
 		}
 	}
 }

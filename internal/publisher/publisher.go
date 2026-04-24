@@ -30,11 +30,15 @@ func (e *InfrastructureError) Unwrap() error { return e.Cause }
 // Publisher manages a single AMQP connection and channel, publishing messages
 // with publisher confirms. It is safe for concurrent use.
 //
-// Zombie connection detection is handled internally via NotifyClose listeners
-// registered on every connect. When the broker closes the connection or channel
+// Zombie connection detection is handled via NotifyClose listeners registered
+// on every connect. When the broker closes the connection or channel
 // unexpectedly (network drop, broker restart, heartbeat timeout), the Publisher
 // marks itself as dirty so the next Publish call reconnects cleanly — without
 // any knowledge required from callers.
+//
+// FIX: watchClose previously called closeUnsafe() directly from its goroutine,
+// racing with in-flight Publish calls. The goroutine now only sets the dirty
+// flag; closeUnsafe is only called from ensureConnected, which holds p.mu.
 type Publisher struct {
 	cfg    config.RabbitMQConfig
 	logger *zap.Logger
@@ -42,6 +46,7 @@ type Publisher struct {
 	mu      sync.Mutex
 	conn    *amqp.Connection
 	channel *amqp.Channel
+	dirty   bool // true when watchClose detected an unexpected close
 }
 
 // New creates a Publisher and establishes the initial connection.
@@ -65,63 +70,64 @@ func (p *Publisher) Close() {
 // is unavailable, it returns an InfrastructureError so the caller can apply
 // the appropriate retry policy.
 func (p *Publisher) Publish(ctx context.Context, routingKey string, body []byte) error {
-	// Fail fast if the context is already done before acquiring the lock.
-	select {
-	case <-ctx.Done():
-		return &InfrastructureError{Cause: fmt.Errorf("context cancelled before publish: %w", ctx.Err())}
-	default:
-	}
+    select {
+    case <-ctx.Done():
+        return &InfrastructureError{Cause: fmt.Errorf("context cancelled before publish: %w", ctx.Err())}
+    default:
+    }
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if err := p.ensureConnected(); err != nil {
-		return &InfrastructureError{Cause: err}
-	}
-
-	// Register a confirm listener BEFORE publishing — must be buffered
-	// with capacity >= number of messages in flight (1 here).
-	confirms := p.channel.NotifyPublish(make(chan amqp.Confirmation, 1))
-
-	err := p.channel.PublishWithContext(
-		ctx,
-		p.cfg.Exchange,
-		routingKey,
-		true,  // mandatory — return if no queue matches
-		false, // immediate — not supported in RabbitMQ 3+
-		amqp.Publishing{
-			ContentType:  "application/json",
-			DeliveryMode: amqp.Persistent,
-			Timestamp:    time.Now(),
-			Body:         body,
-		},
-	)
-	if err != nil {
-		p.resetUnsafe()
-		return &InfrastructureError{Cause: fmt.Errorf("publish: %w", err)}
-	}
-
-	// Wait for broker acknowledgement with a timeout.
-	select {
-	case conf, ok := <-confirms:
-		if !ok {
-			p.resetUnsafe()
-			return &InfrastructureError{Cause: fmt.Errorf("confirms channel closed before ack")}
-		}
-		if !conf.Ack {
-			p.resetUnsafe()
-			return &InfrastructureError{Cause: fmt.Errorf("broker nacked delivery tag %d", conf.DeliveryTag)}
-		}
-		return nil
-	case <-time.After(5 * time.Second):
-		p.resetUnsafe()
-		return &InfrastructureError{Cause: fmt.Errorf("timeout waiting for broker confirm")}
-	case <-ctx.Done():
-		p.resetUnsafe()
-		return &InfrastructureError{Cause: fmt.Errorf("context cancelled waiting for confirm: %w", ctx.Err())}
-	}
+    // Fase 1: setup — precisa do mutex para acessar p.channel com segurança.
+    p.mu.Lock()
+    if err := p.ensureConnected(); err != nil {
+        p.mu.Unlock()
+        return &InfrastructureError{Cause: err}
+    }
+    ch := p.channel
+    confirms := ch.NotifyPublish(make(chan amqp.Confirmation, 1))
+    err := ch.PublishWithContext(
+        ctx, p.cfg.Exchange, routingKey, true, false,
+        amqp.Publishing{
+            ContentType:  "application/json",
+            DeliveryMode: amqp.Persistent,
+            Timestamp:    time.Now(),
+            Body:         body,
+        },
+    )
+    if err != nil {
+        p.resetUnsafe()
+        p.mu.Unlock()
+        return &InfrastructureError{Cause: fmt.Errorf("publish: %w", err)}
+    }
+    p.mu.Unlock() // ← libera ANTES de esperar o confirm
+    
+    // Fase 2: aguarda confirm — sem mutex, outros workers podem publicar em paralelo.
+    select {
+    case conf, ok := <-confirms:
+        if !ok {
+            p.mu.Lock()
+            p.resetUnsafe()
+            p.mu.Unlock()
+            return &InfrastructureError{Cause: fmt.Errorf("confirms channel closed before ack")}
+        }
+        if !conf.Ack {
+            p.mu.Lock()
+            p.resetUnsafe()
+            p.mu.Unlock()
+            return &InfrastructureError{Cause: fmt.Errorf("broker nacked delivery tag %d", conf.DeliveryTag)}
+        }
+        return nil
+    case <-time.After(5 * time.Second):
+        p.mu.Lock()
+        p.resetUnsafe()
+        p.mu.Unlock()
+        return &InfrastructureError{Cause: fmt.Errorf("timeout waiting for broker confirm")}
+    case <-ctx.Done():
+        p.mu.Lock()
+        p.resetUnsafe()
+        p.mu.Unlock()
+        return &InfrastructureError{Cause: fmt.Errorf("context cancelled waiting for confirm: %w", ctx.Err())}
+    }
 }
-
 // connect opens the AMQP connection and channel, registers NotifyClose
 // listeners for zombie detection, and enables publisher confirms.
 // Must be called with p.mu held or before the publisher is shared.
@@ -156,62 +162,68 @@ func (p *Publisher) connect() error {
 
 	p.conn = conn
 	p.channel = ch
+	p.dirty = false
 
 	// Watch for unexpected closes in background goroutines.
-	// When the broker drops the connection or channel (network failure,
-	// broker restart, missed heartbeat), these listeners fire and mark
-	// the Publisher as dirty. The next Publish call will then reconnect
-	// cleanly via ensureConnected — callers never need to know this happened.
 	p.watchClose(conn, ch)
 
 	return nil
 }
 
-// watchClose starts two background goroutines that listen for unexpected
-// connection/channel closes and reset the Publisher state so the next
+// watchClose starts a background goroutine that listens for unexpected
+// connection/channel closes and marks the Publisher as dirty so the next
 // Publish call triggers a clean reconnect.
 //
-// This is the core zombie-connection fix: instead of callers checking if
-// the connection is alive, the Publisher proactively detects and clears
-// stale state the moment the broker signals a problem.
+// FIX (was): previously called closeUnsafe() directly from this goroutine,
+// which raced with in-flight Publish calls. Now it only sets p.dirty = true.
+// closeUnsafe is only ever called from ensureConnected (which holds p.mu),
+// keeping teardown and reconnect serialised with all publish operations.
 func (p *Publisher) watchClose(conn *amqp.Connection, ch *amqp.Channel) {
 	connClose := conn.NotifyClose(make(chan *amqp.Error, 1))
 	chanClose := ch.NotifyClose(make(chan *amqp.Error, 1))
 
 	go func() {
+		var reason string
+
 		select {
 		case err, ok := <-connClose:
 			if !ok {
-				// closed cleanly via p.Close() — nothing to do
+				// Closed cleanly via p.Close() — nothing to do.
 				return
 			}
-			p.logger.Warn("rabbitmq connection closed unexpectedly, will reconnect on next publish",
-				zap.String("reason", err.Error()),
-			)
+			reason = err.Error()
 		case err, ok := <-chanClose:
 			if !ok {
 				return
 			}
-			p.logger.Warn("rabbitmq channel closed unexpectedly, will reconnect on next publish",
-				zap.String("reason", err.Error()),
-			)
+			reason = err.Error()
 		}
 
-		// Mark the publisher as dirty — ensureConnected will reconnect.
+		p.logger.Warn("rabbitmq connection/channel closed unexpectedly, marking dirty — will reconnect on next publish",
+			zap.String("reason", reason),
+		)
+
+		// Only set the flag; do NOT call closeUnsafe here.
+		// The next Publish call will call ensureConnected (under p.mu),
+		// which checks dirty, tears down safely, and reconnects.
 		p.mu.Lock()
-		p.closeUnsafe()
+		p.dirty = true
 		p.mu.Unlock()
 	}()
 }
 
-// ensureConnected reconnects if the connection or channel is closed.
+// ensureConnected reconnects if the connection is closed or marked dirty.
 // Must be called with p.mu held.
 func (p *Publisher) ensureConnected() error {
-	if p.conn != nil && !p.conn.IsClosed() && p.channel != nil {
+	if !p.dirty && p.conn != nil && !p.conn.IsClosed() && p.channel != nil {
 		return nil
 	}
 
-	p.logger.Warn("rabbitmq connection lost, reconnecting")
+	p.logger.Warn("rabbitmq reconnecting",
+		zap.Bool("dirty_flag", p.dirty),
+		zap.Bool("conn_nil", p.conn == nil),
+	)
+
 	p.closeUnsafe()
 	return p.connect()
 }
@@ -233,4 +245,5 @@ func (p *Publisher) closeUnsafe() {
 		p.conn.Close()
 		p.conn = nil
 	}
+	p.dirty = false
 }

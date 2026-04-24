@@ -52,7 +52,7 @@ func (p *Processor) Process(ctx context.Context, event db.OutboxEvent) {
 			zap.String("event_type", event.EventType),
 			zap.Error(err),
 		)
-		p.applyFailure(ctx, event, fmt.Errorf("build payload: %w", err))
+		p.applyFailure(event, fmt.Errorf("build payload: %w", err))
 		return
 	}
 
@@ -71,7 +71,7 @@ func (p *Processor) Process(ctx context.Context, event db.OutboxEvent) {
 			zap.String("event_type", event.EventType),
 			zap.Error(publishErr),
 		)
-		p.applyFailure(ctx, event, publishErr)
+		p.applyFailure(event, publishErr)
 		return
 	}
 
@@ -99,13 +99,27 @@ func (p *Processor) buildPayload(event db.OutboxEvent) ([]byte, error) {
 }
 
 // applyFailure selects the appropriate retry handler and writes the result.
-func (p *Processor) applyFailure(ctx context.Context, event db.OutboxEvent, err error) {
+//
+// FIX: the caller's ctx (with the 30s publish timeout) may already be expired
+// or nearly expired when applyFailure runs, causing UpdateEvent to fail
+// silently and leaving the event stuck in "processing" forever.
+//
+// We use a detached context here — the same pattern already used in
+// markPublished — so the DB write is never aborted by the publish timeout.
+// 10s is intentionally generous: this is a critical write.
+func (p *Processor) applyFailure(event db.OutboxEvent, err error) {
 	handler := retry.For(err)
 	params := handler.Handle(event, err)
 
-	if updateErr := p.store.UpdateEvent(ctx, params); updateErr != nil {
-		p.logger.Error("failed to persist failure result",
+	persistCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if updateErr := p.store.UpdateEvent(persistCtx, params); updateErr != nil {
+		// Situation: publish failed AND we can't persist the failure.
+		// The event stays in "processing" until ReclaimStaleProcessing acts.
+		p.logger.Error("CRITICAL: failed to persist failure result — event stuck in processing until reclaim",
 			zap.Int64("event_id", event.ID),
+			zap.String("event_type", event.EventType),
 			zap.Error(updateErr),
 		)
 		return
