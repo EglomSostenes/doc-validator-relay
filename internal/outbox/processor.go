@@ -56,7 +56,15 @@ func (p *Processor) Process(ctx context.Context, event db.OutboxEvent) {
 		return
 	}
 
-	publishErr := p.publisher.Publish(ctx, event.EventType, payload)
+	// Wrap the publish call in a hard timeout so a hung broker connection
+	// never leaks a goroutine indefinitely. 30s is generous — the broker
+	// confirm timeout inside publisher is 5s, but network stalls can delay
+	// even the initial write. If this fires, the event gets an infrastructure
+	// retry and will be reclaimed normally.
+	publishCtx, cancelPublish := context.WithTimeout(ctx, 30*time.Second)
+	defer cancelPublish()
+
+	publishErr := p.publisher.Publish(publishCtx, event.EventType, payload)
 	if publishErr != nil {
 		p.logger.Warn("failed to publish event",
 			zap.Int64("event_id", event.ID),
