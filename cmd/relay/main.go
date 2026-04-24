@@ -43,11 +43,11 @@ func main() {
 
 	// ── RabbitMQ topology ───────────────────────────────────────────────────
 	// Provision is idempotent: safe to run on every startup.
-	topology := publisher.DefaultTopology(cfg.RabbitMQ)
-	if err := provisionWithRetry(cfg.RabbitMQ, topology, logger); err != nil {
-		logger.Fatal("cannot provision rabbitmq topology", zap.Error(err))
-	}
-	logger.Info("rabbitmq topology ready")
+	// topology := publisher.DefaultTopology(cfg.RabbitMQ)
+	// if err := provisionWithRetry(cfg.RabbitMQ, topology, logger); err != nil {
+		// logger.Fatal("cannot provision rabbitmq topology", zap.Error(err))
+	// }
+	// logger.Info("rabbitmq topology ready")
 
 	// ── Publisher ───────────────────────────────────────────────────────────
 	pub, err := publisher.New(cfg.RabbitMQ, logger)
