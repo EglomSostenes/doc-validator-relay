@@ -60,6 +60,7 @@ func NewPoller(claimer Claimer, processor *Processor, cfg config.RelayConfig, lo
 // Run starts the polling loop. It blocks until ctx is cancelled.
 // Designed to be launched as a goroutine from main.
 func (p *Poller) Run(ctx context.Context) {
+	cycle := 0
 	p.logger.Info("poller started",
 		zap.Int("batch_size", p.cfg.BatchSize),
 		zap.Duration("poll_interval", p.cfg.PollInterval),
@@ -96,6 +97,12 @@ func (p *Poller) Run(ctx context.Context) {
 
 		case <-pollTicker.C:
 			full := p.poll(ctx, sem)
+			cycle++
+			if cycle%1000 == 0 {
+				p.logger.Info("poller health",
+					zap.Int("cycle", cycle),
+				)
+			}
 			if full {
 				// Full batch returned — there may be more events queued.
 				// Reset to fire immediately on the next iteration so we

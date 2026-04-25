@@ -8,11 +8,11 @@ import (
 )
 
 // Config holds all configuration for the relay service.
-// All values are loaded from environment variables at startup.
 type Config struct {
 	Postgres  PostgresConfig
 	RabbitMQ  RabbitMQConfig
 	Relay     RelayConfig
+	LogLevel  string   // ← NOVO
 }
 
 type PostgresConfig struct {
@@ -25,22 +25,16 @@ type RabbitMQConfig struct {
 	User     string
 	Password string
 	VHost    string
-
 	Exchange string
 }
 
 type RelayConfig struct {
-	BatchSize       int
-	PollInterval    time.Duration
-	WorkerCount     int
-	// How long an event can stay in "processing" before being considered stale
-	// and eligible for reprocessing (guards against crashed workers).
+	BatchSize         int
+	PollInterval      time.Duration
+	WorkerCount       int
 	ProcessingTimeout time.Duration
 }
 
-// Load reads configuration from environment variables and returns a validated Config.
-// Returns an error listing every missing or invalid variable so operators can fix
-// all problems in a single restart.
 func Load() (*Config, error) {
 	var errs []string
 
@@ -98,6 +92,7 @@ func Load() (*Config, error) {
 			WorkerCount:       optionalInt("RELAY_WORKER_COUNT", 10),
 			ProcessingTimeout: optionalDuration("RELAY_PROCESSING_TIMEOUT", 5*time.Minute),
 		},
+		LogLevel: getEnvOrDefault("LOG_LEVEL", "info"), // ← NOVO
 	}
 
 	if len(errs) > 0 {

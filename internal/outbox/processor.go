@@ -44,6 +44,13 @@ func NewProcessor(publisher Publisher, store EventStore, logger *zap.Logger) *Pr
 // It never returns an error — all outcomes are recorded in the database.
 // This keeps the Poller loop simple: launch and forget.
 func (p *Processor) Process(ctx context.Context, event db.OutboxEvent) {
+	p.logger.Debug("processing event",
+		zap.Int64("event_id", event.ID),
+		zap.String("event_type", event.EventType),
+		zap.Int("retry_count", event.RetryCount),
+		zap.Int("infrastructure_retry_count", event.InfrastructureRetryCount),
+	)
+	
 	payload, err := p.buildPayload(event)
 	if err != nil {
 		// Malformed payload is a business failure — it will never succeed.

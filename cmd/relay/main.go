@@ -5,109 +5,66 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	// "time" // REMOVIDO: era usado apenas no provisionWithRetry (infra), que foi desativado
 
 	"github.com/joho/godotenv"
 	"go.uber.org/zap"
 
 	"github.com/doc-validator/relay/internal/config"
 	"github.com/doc-validator/relay/internal/db"
+	"github.com/doc-validator/relay/internal/logger"
 	"github.com/doc-validator/relay/internal/outbox"
 	"github.com/doc-validator/relay/internal/publisher"
 )
 
 func main() {
-	// Load .env file if present (development convenience, ignored in production
-	// where env vars are injected by Docker / the orchestrator).
+	// Load .env file if present
 	_ = godotenv.Load()
 
-	logger := buildLogger()
-	defer logger.Sync() //nolint:errcheck
-
+	// Carregar configuração (inclui LOG_LEVEL)
 	cfg, err := config.Load()
 	if err != nil {
-		logger.Fatal("invalid configuration", zap.Error(err))
+		panic("failed to load config: " + err.Error())
 	}
 
-	// Root context cancelled on SIGINT / SIGTERM for graceful shutdown.
+	// Criar logger estruturado baseado no LOG_LEVEL
+	log, err := logger.New(cfg.LogLevel)
+	if err != nil {
+		panic("failed to create logger: " + err.Error())
+	}
+	defer log.Sync()
+
+	// Root context cancelled on SIGINT / SIGTERM
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	// ── Database ────────────────────────────────────────────────────────────
 	pool, err := db.New(ctx, cfg.Postgres)
 	if err != nil {
-		logger.Fatal("cannot connect to postgres", zap.Error(err))
+		log.Fatal("cannot connect to postgres", zap.Error(err))
 	}
 	defer pool.Close()
-	logger.Info("postgres connected")
+	log.Info("postgres connected")
 
-	// ── RabbitMQ topology ───────────────────────────────────────────────────
-	// DESATIVADO:
-	// A infraestrutura (exchange, queues, bindings) agora é provisionada via
-	// Docker + definitions.json. O relay NÃO deve mais declarar recursos.
-	//
-	// topology := publisher.DefaultTopology(cfg.RabbitMQ)
-	// if err := provisionWithRetry(cfg.RabbitMQ, topology, logger); err != nil {
-	//     logger.Fatal("cannot provision rabbitmq topology", zap.Error(err))
-	// }
-	// logger.Info("rabbitmq topology ready")
+	// ── RabbitMQ topology (provisionado via Docker definitions.json) ────────
+	// (nada a fazer aqui)
 
 	// ── Publisher ───────────────────────────────────────────────────────────
-	pub, err := publisher.New(cfg.RabbitMQ, logger)
+	pub, err := publisher.New(cfg.RabbitMQ, log.Named("publisher"))
 	if err != nil {
-		logger.Fatal("cannot create rabbitmq publisher", zap.Error(err))
+		log.Fatal("cannot create rabbitmq publisher", zap.Error(err))
 	}
 	defer pub.Close()
-	logger.Info("rabbitmq publisher ready")
+	log.Info("rabbitmq publisher ready")
 
 	// ── Outbox relay ────────────────────────────────────────────────────────
-	processor := outbox.NewProcessor(pub, pool, logger)
-	poller := outbox.NewPoller(pool, processor, cfg.Relay, logger)
+	processor := outbox.NewProcessor(pub, pool, log.Named("processor"))
+	poller := outbox.NewPoller(pool, processor, cfg.Relay, log.Named("poller"))
 
-	logger.Info("doc-validator-relay starting")
+	log.Info("doc-validator-relay starting",
+		zap.String("log_level", cfg.LogLevel),
+		zap.Int("batch_size", cfg.Relay.BatchSize),
+	)
 	poller.Run(ctx) // blocks until ctx is cancelled
 
-	logger.Info("doc-validator-relay stopped gracefully")
-}
-
-/*
-DESATIVADO:
-Provisionamento de infraestrutura RabbitMQ foi movido para o ambiente (Docker + definitions.json).
-
-Motivo:
-- Evitar conflito de declaração (PRECONDITION_FAILED)
-- Separar responsabilidade: infra vs aplicação
-- Tornar o relay focado apenas em publicação (outbox pattern)
-
-Se necessário reativar (ambiente sem definitions.json), restaurar uso em main.go.
-
-func provisionWithRetry(cfg config.RabbitMQConfig, topology publisher.Topology, logger *zap.Logger) error {
-	const maxAttempts = 10
-	const backoff = 3 * time.Second
-
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		err := publisher.Provision(cfg, topology, logger)
-		if err == nil {
-			return nil
-		}
-		logger.Warn("rabbitmq not ready, retrying",
-			zap.Int("attempt", attempt),
-			zap.Int("max_attempts", maxAttempts),
-			zap.Duration("backoff", backoff),
-			zap.Error(err),
-		)
-		time.Sleep(backoff)
-	}
-
-	return publisher.Provision(cfg, topology, logger)
-}
-*/
-
-func buildLogger() *zap.Logger {
-	if os.Getenv("RAILS_ENV") == "production" || os.Getenv("GO_ENV") == "production" {
-		l, _ := zap.NewProduction()
-		return l
-	}
-	l, _ := zap.NewDevelopment()
-	return l
+	log.Info("doc-validator-relay stopped gracefully")
 }
