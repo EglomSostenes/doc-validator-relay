@@ -31,7 +31,7 @@ func main() {
 	if err != nil {
 		panic("failed to create logger: " + err.Error())
 	}
-	defer log.Sync()
+	defer func() { _ = log.Sync() }()
 
 	// Root context cancelled on SIGINT / SIGTERM
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
