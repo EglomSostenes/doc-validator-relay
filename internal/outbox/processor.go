@@ -175,6 +175,7 @@ func (p *Processor) markPublished(ctx context.Context, event db.OutboxEvent) {
 	persistCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	loop:
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		err := p.store.UpdateEvent(persistCtx, params)
 		if err == nil {
@@ -195,7 +196,7 @@ func (p *Processor) markPublished(ctx context.Context, event db.OutboxEvent) {
 
 		select {
 		case <-persistCtx.Done():
-			break
+			break loop
 		case <-time.After(backoff):
 			backoff *= 2 // exponential: 100ms → 200ms → 400ms → 800ms → 1.6s
 		}
