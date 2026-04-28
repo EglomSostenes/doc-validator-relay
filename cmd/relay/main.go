@@ -49,7 +49,7 @@ func main() {
 	// (nada a fazer aqui)
 
 	// ── Publisher ───────────────────────────────────────────────────────────
-	pub, err := publisher.New(cfg.RabbitMQ, log.Named("publisher"))
+	pub, err := publisher.New(cfg.RabbitMQ, cfg.Relay.WorkerCount, log.Named("publisher"))
 	if err != nil {
 		log.Fatal("cannot create rabbitmq publisher", zap.Error(err))
 	}
