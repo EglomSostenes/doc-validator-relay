@@ -9,10 +9,10 @@ import (
 
 // Config holds all configuration for the relay service.
 type Config struct {
-	Postgres  PostgresConfig
-	RabbitMQ  RabbitMQConfig
-	Relay     RelayConfig
-	LogLevel  string   // ← NOVO
+	Postgres PostgresConfig
+	RabbitMQ RabbitMQConfig
+	Relay    RelayConfig
+	LogLevel string
 }
 
 type PostgresConfig struct {
@@ -33,6 +33,7 @@ type RelayConfig struct {
 	PollInterval      time.Duration
 	WorkerCount       int
 	ProcessingTimeout time.Duration
+	FlushInterval     time.Duration
 }
 
 func Load() (*Config, error) {
@@ -91,8 +92,9 @@ func Load() (*Config, error) {
 			PollInterval:      optionalDuration("RELAY_POLL_INTERVAL", 3*time.Second),
 			WorkerCount:       optionalInt("RELAY_WORKER_COUNT", 10),
 			ProcessingTimeout: optionalDuration("RELAY_PROCESSING_TIMEOUT", 5*time.Minute),
+			FlushInterval:     optionalDuration("RELAY_FLUSH_INTERVAL", 200*time.Millisecond),
 		},
-		LogLevel: getEnvOrDefault("LOG_LEVEL", "info"), // ← NOVO
+		LogLevel: getEnvOrDefault("LOG_LEVEL", "info"),
 	}
 
 	if len(errs) > 0 {

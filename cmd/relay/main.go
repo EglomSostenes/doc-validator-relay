@@ -20,7 +20,7 @@ func main() {
 	// Load .env file if present
 	_ = godotenv.Load()
 
-	// Carregar configuração (inclui LOG_LEVEL)
+	// Carregar configuração (inclui LOG_LEVEL e RELAY_FLUSH_INTERVAL)
 	cfg, err := config.Load()
 	if err != nil {
 		panic("failed to load config: " + err.Error())
@@ -45,9 +45,6 @@ func main() {
 	defer pool.Close()
 	log.Info("postgres connected")
 
-	// ── RabbitMQ topology (provisionado via Docker definitions.json) ────────
-	// (nada a fazer aqui)
-
 	// ── Publisher ───────────────────────────────────────────────────────────
 	pub, err := publisher.New(cfg.RabbitMQ, cfg.Relay.WorkerCount, log.Named("publisher"))
 	if err != nil {
@@ -56,13 +53,27 @@ func main() {
 	defer pub.Close()
 	log.Info("rabbitmq publisher ready")
 
+	// ── Buffered event store ─────────────────────────────────────────────────
+	// Sits between the Processor and the database. Accumulates UpdateParams
+	// and flushes them in batches to reduce round-trips under load.
+	// Run() is launched as a goroutine and blocks until ctx is cancelled,
+	// performing a final flush on shutdown before returning.
+	bufferedStore := outbox.NewBufferedEventStore(
+		pool,
+		cfg.Relay.BatchSize,
+		cfg.Relay.FlushInterval,
+		log.Named("buffered_store"),
+	)
+	go bufferedStore.Run(ctx)
+
 	// ── Outbox relay ────────────────────────────────────────────────────────
-	processor := outbox.NewProcessor(pub, pool, log.Named("processor"))
+	processor := outbox.NewProcessor(pub, bufferedStore, log.Named("processor"))
 	poller := outbox.NewPoller(pool, processor, cfg.Relay, log.Named("poller"))
 
 	log.Info("doc-validator-relay starting",
 		zap.String("log_level", cfg.LogLevel),
 		zap.Int("batch_size", cfg.Relay.BatchSize),
+		zap.Duration("flush_interval", cfg.Relay.FlushInterval),
 	)
 	poller.Run(ctx) // blocks until ctx is cancelled
 

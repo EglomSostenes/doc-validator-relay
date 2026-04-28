@@ -31,17 +31,17 @@ const (
 
 // OutboxEvent mirrors the outbox_events table in the Rails database.
 type OutboxEvent struct {
-	ID                        int64
-	EventType                 string
-	Payload                   []byte
-	Status                    Status
-	RetryCount                int
-	RetryAfter                *time.Time
-	InfrastructureRetryCount  int
-	InfrastructureRetryAfter  *time.Time
-	FailureReason             *FailureReason
-	CreatedAt                 time.Time
-	UpdatedAt                 time.Time
+	ID                       int64
+	EventType                string
+	Payload                  []byte
+	Status                   Status
+	RetryCount               int
+	RetryAfter               *time.Time
+	InfrastructureRetryCount int
+	InfrastructureRetryAfter *time.Time
+	FailureReason            *FailureReason
+	CreatedAt                time.Time
+	UpdatedAt                time.Time
 }
 
 // UpdateParams carries only the fields the relay needs to write back.
@@ -150,19 +150,106 @@ func (p *Pool) ReclaimStaleProcessing(ctx context.Context, timeout time.Duration
 	return tag.RowsAffected(), nil
 }
 
-// UpdateEvent writes the result of a publish attempt back to the database.
-// Only non-nil fields in UpdateParams are applied, keeping queries intentional.
+// UpdateEvent writes the result of a single publish attempt back to the
+// database. Kept for compatibility — internally delegates to UpdateBatch.
 func (p *Pool) UpdateEvent(ctx context.Context, params UpdateParams) error {
+	return p.UpdateBatch(ctx, []UpdateParams{params})
+}
+
+// UpdateBatch writes multiple publish results in a single round-trip using
+// UNNEST. This is the primary write path under load — the BufferedEventStore
+// accumulates UpdateParams and flushes them here.
+//
+// The COALESCE preserves the same partial-update semantics as the original
+// single-row UpdateEvent: nil pointers leave the column unchanged.
+//
+// Nil pointer columns are expanded as typed NULL arrays so Postgres can
+// resolve the overloaded UNNEST without ambiguity.
+func (p *Pool) UpdateBatch(ctx context.Context, params []UpdateParams) error {
+	if len(params) == 0 {
+		return nil
+	}
+
+	// Single-row fast path — avoids UNNEST overhead for the common case
+	// where the BufferedEventStore flushes a batch of one (e.g. low traffic).
+	if len(params) == 1 {
+		return p.updateSingle(ctx, params[0])
+	}
+
+	// Expand UpdateParams into typed column arrays for UNNEST.
+	ids := make([]int64, len(params))
+	statuses := make([]int, len(params))
+	failureReasons := make([]*string, len(params))
+	retryCounts := make([]*int, len(params))
+	retryAfters := make([]*time.Time, len(params))
+	infraRetryCounts := make([]*int, len(params))
+	infraRetryAfters := make([]*time.Time, len(params))
+
+	for i, p := range params {
+		ids[i] = p.ID
+		statuses[i] = int(p.Status)
+		if p.FailureReason != nil {
+			s := string(*p.FailureReason)
+			failureReasons[i] = &s
+		}
+		retryCounts[i] = p.RetryCount
+		retryAfters[i] = p.RetryAfter
+		infraRetryCounts[i] = p.InfrastructureRetryCount
+		infraRetryAfters[i] = p.InfrastructureRetryAfter
+	}
+
+	query := `
+		UPDATE outbox_events AS o
+		SET
+			status                     = u.status,
+			failure_reason             = u.failure_reason,
+			retry_count                = COALESCE(u.retry_count, o.retry_count),
+			retry_after                = u.retry_after,
+			infrastructure_retry_count = COALESCE(u.infrastructure_retry_count, o.infrastructure_retry_count),
+			infrastructure_retry_after = u.infrastructure_retry_after,
+			updated_at                 = NOW()
+		FROM (
+			SELECT
+				UNNEST($1::bigint[])      AS id,
+				UNNEST($2::int[])         AS status,
+				UNNEST($3::text[])        AS failure_reason,
+				UNNEST($4::int[])         AS retry_count,
+				UNNEST($5::timestamptz[]) AS retry_after,
+				UNNEST($6::int[])         AS infrastructure_retry_count,
+				UNNEST($7::timestamptz[]) AS infrastructure_retry_after
+		) AS u
+		WHERE o.id = u.id
+	`
+
+	_, err := p.pool.Exec(ctx, query,
+		ids,
+		statuses,
+		failureReasons,
+		retryCounts,
+		retryAfters,
+		infraRetryCounts,
+		infraRetryAfters,
+	)
+	if err != nil {
+		return fmt.Errorf("update batch (%d events): %w", len(params), err)
+	}
+
+	return nil
+}
+
+// updateSingle is the fast path for a batch of one. Identical semantics to
+// the original UpdateEvent query — no UNNEST overhead.
+func (p *Pool) updateSingle(ctx context.Context, params UpdateParams) error {
 	query := `
 		UPDATE outbox_events
 		SET
-			status                    = $2,
-			failure_reason            = $3,
-			retry_count               = COALESCE($4, retry_count),
-			retry_after               = $5,
+			status                     = $2,
+			failure_reason             = $3,
+			retry_count                = COALESCE($4, retry_count),
+			retry_after                = $5,
 			infrastructure_retry_count = COALESCE($6, infrastructure_retry_count),
 			infrastructure_retry_after = $7,
-			updated_at                = NOW()
+			updated_at                 = NOW()
 		WHERE id = $1
 	`
 
